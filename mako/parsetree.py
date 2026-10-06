@@ -17,6 +17,11 @@ from mako import util
 class Node:
     """base class for a Node in the parse tree."""
 
+    #: True if the node makes use of ``await``, ``async for`` or
+    #: ``async with`` and therefore requires the template to be
+    #: rendered asynchronously
+    has_await = False
+
     def __init__(self, source, lineno, pos, filename):
         self.source = source
         self.lineno = lineno
@@ -89,6 +94,7 @@ class ControlLine(Node):
             code = ast.PythonFragment(text, **self.exception_kwargs)
             self._declared_identifiers = code.declared_identifiers
             self._undeclared_identifiers = code.undeclared_identifiers
+            self.has_await = code.has_await
 
     def get_children(self):
         return self.nodes
@@ -153,6 +159,7 @@ class Code(Node):
         self.text = text
         self.ismodule = ismodule
         self.code = ast.PythonCode(text, **self.exception_kwargs)
+        self.has_await = self.code.has_await
 
     def declared_identifiers(self):
         return self.code.declared_identifiers
@@ -196,6 +203,7 @@ class Expression(Node):
         self.escapes = escapes
         self.escapes_code = ast.ArgumentList(escapes, **self.exception_kwargs)
         self.code = ast.PythonCode(text, **self.exception_kwargs)
+        self.has_await = self.code.has_await
 
     def declared_identifiers(self):
         return []
@@ -573,6 +581,7 @@ class CallTag(Tag):
         )
         self.expression = attributes["expr"]
         self.code = ast.PythonCode(self.expression, **self.exception_kwargs)
+        self.has_await = self.code.has_await
         self.body_decl = ast.FunctionArgs(
             attributes.get("args", ""), **self.exception_kwargs
         )
@@ -608,6 +617,7 @@ class CallNamespaceTag(Tag):
         )
 
         self.code = ast.PythonCode(self.expression, **self.exception_kwargs)
+        self.has_await = self.code.has_await
         self.body_decl = ast.FunctionArgs(
             attributes.get("args", ""), **self.exception_kwargs
         )

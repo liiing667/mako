@@ -9,6 +9,7 @@ Namespace, and various helper functions."""
 
 import builtins
 import functools
+import inspect
 import sys
 
 from mako import compat
@@ -41,6 +42,11 @@ class Context:
 
         # "caller" stack used by def calls with content
         self.caller_stack = self._data["caller"] = CallerStack()
+
+        # True while the template is being rendered through the
+        # async rendering entry points; lets inheritance and include
+        # resolution select async-compatible callables
+        self._rendering_async = False
 
     def _set_with_template(self, t):
         self._with_template = t
@@ -154,6 +160,7 @@ class Context:
         c._kwargs = self._kwargs
         c._with_template = self._with_template
         c._outputting_as_unicode = self._outputting_as_unicode
+        c._rendering_async = self._rendering_async
         c.namespaces = self.namespaces
         c.caller_stack = self.caller_stack
         return c
@@ -771,6 +778,7 @@ def _include_file(context, uri, calling_uri, **kwargs):
     the current output."""
 
     template = _lookup_template(context, uri, calling_uri)
+    _check_async_template(template)
     callable_, ctx = _populate_self_namespace(
         context._clean_inheritance_tokens(), template
     )
@@ -784,6 +792,52 @@ def _include_file(context, uri, calling_uri, **kwargs):
                 raise
     else:
         callable_(ctx, **kwargs)
+
+
+async def _include_file_async(context, uri, calling_uri, **kwargs):
+    """async variant of :func:`_include_file`, used by templates that
+    are compiled for asynchronous rendering.
+
+    the included template may itself be a regular, synchronous template,
+    in which case its output is produced without awaiting.
+
+    """
+
+    template = _lookup_template(context, uri, calling_uri)
+    callable_, ctx = _populate_self_namespace(
+        context._clean_inheritance_tokens(), template
+    )
+    kwargs = _kwargs_for_include(callable_, context._data, **kwargs)
+    if template.include_error_handler:
+        try:
+            await _maybe_await(callable_(ctx, **kwargs))
+        except Exception:
+            result = template.include_error_handler(ctx, compat.exception_as())
+            if not result:
+                raise
+    else:
+        await _maybe_await(callable_(ctx, **kwargs))
+
+
+async def _maybe_await(value):
+    """await the given value if it is awaitable, return it unchanged
+    otherwise."""
+
+    if inspect.isawaitable(value):
+        return await value
+    return value
+
+
+def _check_async_template(template):
+    """raise if the given template was compiled for asynchronous
+    rendering, as it cannot be rendered through the synchronous
+    rendering entry points."""
+
+    if getattr(template.module, "_enable_async", False):
+        raise exceptions.RuntimeException(
+            "Template '%s' uses async syntax (await, async for, async "
+            "with); use render_async() to render it" % template.uri
+        )
 
 
 def _inherit_from(context, uri, calling_uri):
@@ -815,6 +869,13 @@ def _inherit_from(context, uri, calling_uri):
     gen_ns = getattr(template.module, "_mako_generate_namespaces", None)
     if gen_ns is not None:
         gen_ns(context)
+    if getattr(context, "_rendering_async", False):
+        # we are rendering asynchronously; use an async-compatible
+        # variant of the parent template, since it may invoke the
+        # (possibly async) child through self/next
+        return (template.async_callable, lclcontext)
+    else:
+        _check_async_template(template)
     return (template.callable_, lclcontext)
 
 
@@ -847,12 +908,16 @@ def _populate_self_namespace(context, template, self_ns=None):
         ret = template.module._mako_inherit(template, context)
         if ret:
             return ret
+    if getattr(context, "_rendering_async", False):
+        return (template.async_callable, context)
     return (template.callable_, context)
 
 
 def _render(template, callable_, args, data, as_unicode=False):
     """create a Context and return the string
     output of the given template and template callable."""
+
+    _check_async_template(template)
 
     if as_unicode:
         buf = util.FastEncodingBuffer()
@@ -865,6 +930,36 @@ def _render(template, callable_, args, data, as_unicode=False):
     context._set_with_template(template)
 
     _render_context(
+        template,
+        callable_,
+        context,
+        *args,
+        **_kwargs_for_callable(callable_, data),
+    )
+    return context._pop_buffer().getvalue()
+
+
+async def _render_async(template, callable_, args, data, as_unicode=False):
+    """async variant of :func:`_render`.
+
+    a template that does not use async syntax renders exactly as it does
+    synchronously -- its callable simply returns instead of producing a
+    coroutine.
+
+    """
+
+    if as_unicode:
+        buf = util.FastEncodingBuffer()
+    else:
+        buf = util.FastEncodingBuffer(
+            encoding=template.output_encoding, errors=template.encoding_errors
+        )
+    context = Context(buf, **data)
+    context._outputting_as_unicode = as_unicode
+    context._rendering_async = True
+    context._set_with_template(template)
+
+    await _render_context_async(
         template,
         callable_,
         context,
@@ -901,6 +996,8 @@ def _kwargs_for_include(callable_, data, **kwargs):
 def _render_context(tmpl, callable_, context, *args, **kwargs):
     import mako.template as template
 
+    _check_async_template(tmpl)
+
     # create polymorphic 'self' namespace for this
     # template with possibly updated context
     if not isinstance(tmpl, template.DefTemplate):
@@ -911,6 +1008,23 @@ def _render_context(tmpl, callable_, context, *args, **kwargs):
         # otherwise, call the actual rendering method specified
         inherit, lclcontext = _populate_self_namespace(context, tmpl.parent)
         _exec_template(callable_, context, args=args, kwargs=kwargs)
+
+
+async def _render_context_async(tmpl, callable_, context, *args, **kwargs):
+    import mako.template as template
+
+    if not isinstance(tmpl, template.DefTemplate):
+        # if main render method, call from the base of the inheritance stack
+        inherit, lclcontext = _populate_self_namespace(context, tmpl)
+        await _exec_template_async(
+            inherit, lclcontext, args=args, kwargs=kwargs
+        )
+    else:
+        # otherwise, call the actual rendering method specified
+        inherit, lclcontext = _populate_self_namespace(context, tmpl.parent)
+        await _exec_template_async(
+            callable_, context, args=args, kwargs=kwargs
+        )
 
 
 def _exec_template(callable_, context, args=None, kwargs=None):
@@ -936,6 +1050,29 @@ def _exec_template(callable_, context, args=None, kwargs=None):
         callable_(context, *args, **kwargs)
 
 
+async def _exec_template_async(callable_, context, args=None, kwargs=None):
+    """async variant of :func:`_exec_template`.
+
+    the rendering callable may be a regular synchronous function, which
+    is called without awaiting.
+
+    """
+
+    template = context._with_template
+    if template is not None and (
+        template.format_exceptions or template.error_handler
+    ):
+        try:
+            await _maybe_await(callable_(context, *args, **kwargs))
+        except Exception:
+            _render_error(template, context, compat.exception_as())
+        except:
+            e = sys.exc_info()[0]
+            _render_error(template, context, e)
+    else:
+        await _maybe_await(callable_(context, *args, **kwargs))
+
+
 def _render_error(template, context, error):
     if template.error_handler:
         result = template.error_handler(context, error)
@@ -958,4 +1095,7 @@ def _render_error(template, context, error):
             ]
 
         context._set_with_template(error_template)
+        # the error template is rendered synchronously, even when
+        # the original render that failed was asynchronous
+        context._rendering_async = False
         error_template.render_context(context, error=error)

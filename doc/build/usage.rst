@@ -232,6 +232,44 @@ Note that Mako's ability to return data in any encoding and/or
 template is a Python unicode object. This behavior is described
 fully in :ref:`unicode_toplevel`.
 
+.. _async_rendering:
+
+Asynchronous Rendering
+======================
+
+Templates may use Python's ``async``/``await`` syntax, including
+``await`` expressions, ``% async for`` and ``% async with`` control
+lines, so that rendering can cooperate with an asyncio event loop
+instead of blocking it:
+
+.. sourcecode:: python
+
+    tmpl = Template("""
+    Hello ${name}
+    % async for row in fetch():
+    ${row}
+    % endfor
+    """)
+
+    out = await tmpl.render_async(name="x")
+
+A template that uses async syntax anywhere is compiled with async
+render callables, and must be rendered with
+:meth:`~.Template.render_async` (or
+:meth:`~.Template.render_async_def` for an individual ``<%def>``);
+calling the synchronous :meth:`~.Template.render` on such a template
+raises :class:`~mako.exceptions.RuntimeException`.  Templates that
+don't use any async syntax render identically through either entry
+point.
+
+``<%inherit>``, ``<%include>``, ``<%block>``, ``<%call>`` and
+namespaces work across the async boundary, including templates loaded
+through :class:`.TemplateLookup`; expressions that resolve to async
+callables, such as ``${self.body()}``, are awaited automatically.
+Cache keys are unchanged by the async entry points.
+
+.. versionadded:: 1.4.4
+
 .. _handling_exceptions:
 
 Handling Exceptions

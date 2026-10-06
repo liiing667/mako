@@ -465,6 +465,14 @@ class Lexer:
             isend, keyword = m2.group(1, 2)
             isend = isend is not None
 
+            if not isend and keyword == "async":
+                # "async for" / "async with" control lines use the
+                # regular "endfor" / "endwith" terminators, so track
+                # them under the underlying keyword
+                m3 = re.match(r"(?:for|with)\b", m2.group(3))
+                if m3:
+                    keyword = m3.group(0)
+
             if isend:
                 if not len(self.control_line):
                     raise exceptions.SyntaxException(

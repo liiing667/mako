@@ -40,6 +40,7 @@ from _ast import Not
 from _ast import NotEq
 from _ast import NotIn
 from _ast import Or
+from _ast import PyCF_ALLOW_TOP_LEVEL_AWAIT
 from _ast import PyCF_ONLY_AST
 from _ast import RShift
 from _ast import Sub
@@ -86,7 +87,9 @@ ALL_SYMBOLS.update(UNARYOP_SYMBOLS)
 
 def parse(expr, filename="<unknown>", mode="exec"):
     """Parse an expression into an AST node."""
-    return compile(expr, filename, mode, PyCF_ONLY_AST)
+    return compile(
+        expr, filename, mode, PyCF_ONLY_AST | PyCF_ALLOW_TOP_LEVEL_AWAIT
+    )
 
 
 def iter_fields(node):

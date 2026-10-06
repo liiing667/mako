@@ -350,6 +350,31 @@ class Template:
         else:
             return codegen.RESERVED_NAMES.difference(["loop"])
 
+    @util.memoized_property
+    def async_callable(self):
+        """A rendering callable for this template that can be awaited.
+
+        If the template was compiled with async render callables, this
+        is the regular :attr:`callable_`.  Otherwise, a variant of the
+        template's module is compiled on demand whose render callables
+        are async, so that the template can take part in an
+        asynchronous render (e.g. as the parent in an inheritance
+        chain, where it may invoke async defs of the inheriting
+        template through ``self`` / ``next``).
+
+        """
+
+        if getattr(self.module, "_enable_async", False):
+            return self.callable_
+        code, module = _compile_text(
+            self,
+            self.source,
+            self.filename,
+            module_id=self.module_id + "_async",
+            force_async=True,
+        )
+        return module.render_body
+
     def _setup_cache_args(
         self,
         cache_impl,
@@ -447,6 +472,36 @@ class Template:
 
         """
         return runtime._render(self, self.callable_, args, data)
+
+    async def render_async(self, *args, **data):
+        """Render the output of this template as a string, awaiting
+        any async constructs used within the template.
+
+        Templates that make use of ``await``, ``% async for`` or
+        ``% async with`` must be rendered using this method; calling
+        :meth:`.render` on such a template raises
+        :class:`.RuntimeException`.
+
+        Templates that don't use any async syntax render exactly as
+        they do with :meth:`.render`.
+
+        .. versionadded:: 1.4.4
+
+        """
+        return await runtime._render_async(
+            self, self.async_callable, args, data
+        )
+
+    async def render_async_def(self, name, *args, **data):
+        """Render the named def of this template asynchronously.
+
+        This is the async equivalent of
+        ``template.get_def(name).render(...)``.
+
+        .. versionadded:: 1.4.4
+
+        """
+        return await self.get_def(name).render_async(*args, **data)
 
     def render_unicode(self, *args, **data):
         """Render the output of this template as a unicode object."""
@@ -580,6 +635,10 @@ class DefTemplate(Template):
     def get_def(self, name):
         return self.parent.get_def(name)
 
+    @property
+    def async_callable(self):
+        return self.callable_
+
 
 class ModuleInfo:
     """Stores information about a module currently loaded into
@@ -654,7 +713,9 @@ class ModuleInfo:
             return self.template_source
 
 
-def _compile(template, text, filename, generate_magic_comment):
+def _compile(
+    template, text, filename, generate_magic_comment, force_async=False
+):
     lexer = template.lexer_cls(
         text,
         filename,
@@ -674,9 +735,20 @@ def _compile(template, text, filename, generate_magic_comment):
         generate_magic_comment=generate_magic_comment,
         strict_undefined=template.strict_undefined,
         enable_loop=template.enable_loop,
+        enable_async=force_async or _uses_async(node),
         reserved_names=template.reserved_names,
     )
     return source, lexer
+
+
+def _uses_async(node):
+    """return True if the given parsetree node (or any of its children)
+    makes use of async syntax and therefore needs async render
+    callables."""
+
+    if getattr(node, "has_await", False):
+        return True
+    return any(_uses_async(child) for child in node.get_children())
 
 
 class _ModuleSourceLoader(abc.Loader):
@@ -804,15 +876,19 @@ def _translate_module_warnings(get_source, module_id, filename):
     return _show_warnings_as(_locate)
 
 
-def _compile_text(template, text, filename):
-    identifier = template.module_id
+def _compile_text(template, text, filename, module_id=None, force_async=False):
+    identifier = module_id or template.module_id
 
     cid = identifier
     module = types.ModuleType(cid)
 
     with _drop_expression_warnings():
         source, lexer = _compile(
-            template, text, filename, generate_magic_comment=False
+            template,
+            text,
+            filename,
+            generate_magic_comment=False,
+            force_async=force_async,
         )
 
     loader = _ModuleSourceLoader(cid, source)

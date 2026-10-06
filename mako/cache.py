@@ -4,6 +4,8 @@
 # This module is part of Mako and is released under
 # the MIT License: http://www.opensource.org/licenses/mit-license.php
 
+import inspect
+
 from mako import util
 
 _cache_plugins = util.PluginLoader("mako.cache")
@@ -81,6 +83,20 @@ class Cache:
 
         return self._ctx_get_or_create(key, creation_function, None, **kw)
 
+    async def get_or_create_async(self, key, creation_function, **kw):
+        """Asynchronous variant of :meth:`get_or_create`.
+
+        If the creation function returns an awaitable, it is awaited
+        before the value is placed into the cache, so the cached value
+        (rather than a one-shot coroutine) is reused by subsequent
+        calls.
+
+        """
+
+        return await self._ctx_get_or_create_async(
+            key, creation_function, None, **kw
+        )
+
     def _ctx_get_or_create(self, key, creation_function, context, **kw):
         """Retrieve a value from the cache, using the given creation function
         to generate a new value."""
@@ -89,6 +105,21 @@ class Cache:
             return creation_function()
 
         return self.impl.get_or_create(
+            key, creation_function, **self._get_cache_kw(kw, context)
+        )
+
+    async def _ctx_get_or_create_async(
+        self, key, creation_function, context, **kw
+    ):
+        """Asynchronous variant of :meth:`_ctx_get_or_create`."""
+
+        if not self.template.cache_enabled:
+            value = creation_function()
+            if inspect.isawaitable(value):
+                value = await value
+            return value
+
+        return await self.impl.get_or_create_async(
             key, creation_function, **self._get_cache_kw(kw, context)
         )
 
@@ -207,6 +238,25 @@ class CacheImpl:
 
         """
         raise NotImplementedError()
+
+    async def get_or_create_async(self, key, creation_function, **kw):
+        r"""Async variant of
+        :meth:`get_or_create <.CacheImpl.get_or_create>`.
+
+        The default implementation awaits the result of
+        ``creation_function`` before storing it, which is correct as
+        long as :meth:`get` returns ``None`` for a missing key.
+        Cache plugins that need different semantics may override this
+        method.
+
+        """
+        value = self.get(key, **kw)
+        if value is None:
+            value = creation_function()
+            if inspect.isawaitable(value):
+                value = await value
+            self.set(key, value, **kw)
+        return value
 
     def set(self, key, value, **kw):
         r"""Place a value in the cache.

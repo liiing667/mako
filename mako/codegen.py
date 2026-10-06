@@ -18,7 +18,7 @@ from mako import parsetree
 from mako import util
 from mako.pygen import PythonPrinter
 
-MAGIC_NUMBER = 10
+MAGIC_NUMBER = 11
 
 # names which are hardwired into the
 # template and are not accessed via the
@@ -39,6 +39,7 @@ def compile(  # noqa
     generate_magic_comment=True,
     strict_undefined=False,
     enable_loop=True,
+    enable_async=False,
     reserved_names=frozenset(),
 ):
     """Generate module source code given a parsetree node,
@@ -60,6 +61,7 @@ def compile(  # noqa
             generate_magic_comment,
             strict_undefined,
             enable_loop,
+            enable_async,
             reserved_names,
         ),
         node,
@@ -80,6 +82,7 @@ class _CompileContext:
         generate_magic_comment,
         strict_undefined,
         enable_loop,
+        enable_async,
         reserved_names,
     ):
         self.uri = uri
@@ -92,6 +95,7 @@ class _CompileContext:
         self.generate_magic_comment = generate_magic_comment
         self.strict_undefined = strict_undefined
         self.enable_loop = enable_loop
+        self.enable_async = enable_async
         self.reserved_names = reserved_names
 
 
@@ -231,6 +235,10 @@ class _GenerateRenderMethod:
         self.printer.writeline("_magic_number = %r" % MAGIC_NUMBER)
         self.printer.writeline("_modified_time = %r" % time.time())
         self.printer.writeline("_enable_loop = %r" % self.compiler.enable_loop)
+        if self.compiler.enable_async:
+            # only written for async templates, so that the generated
+            # source of regular templates is unchanged
+            self.printer.writeline("_enable_async = True")
         self.printer.writeline(
             "_template_filename = %r" % self.compiler.filename
         )
@@ -295,8 +303,9 @@ class _GenerateRenderMethod:
                 )
 
         self.printer.start_source(node.lineno)
+        def_keyword = "async def" if self.compiler.enable_async else "def"
         self.printer.writelines(
-            "def %s(%s):" % (name, ",".join(args)),
+            "%s %s(%s):" % (def_keyword, name, ",".join(args)),
             # push new frame, assign current frame to __M_caller
             "__M_caller = context.caller_stack._push_frame()",
             "try:",
@@ -586,10 +595,20 @@ class _GenerateRenderMethod:
             nameargs.insert(0, "context._locals(__M_locals)")
         else:
             nameargs.insert(0, "context")
-        self.printer.writeline("def %s(%s):" % (funcname, ",".join(namedecls)))
-        self.printer.writeline(
-            "return render_%s(%s)" % (funcname, ",".join(nameargs))
-        )
+        if self.compiler.enable_async:
+            self.printer.writeline(
+                "async def %s(%s):" % (funcname, ",".join(namedecls))
+            )
+            self.printer.writeline(
+                "return await render_%s(%s)" % (funcname, ",".join(nameargs))
+            )
+        else:
+            self.printer.writeline(
+                "def %s(%s):" % (funcname, ",".join(namedecls))
+            )
+            self.printer.writeline(
+                "return render_%s(%s)" % (funcname, ",".join(nameargs))
+            )
         self.printer.writeline(None)
 
     def write_inline_def(self, node, identifiers, nested):
@@ -603,7 +622,12 @@ class _GenerateRenderMethod:
                 "@runtime._decorate_inline(context, %s)" % decorator
             )
         self.printer.writeline(
-            "def %s(%s):" % (node.funcname, ",".join(namedecls))
+            "%s %s(%s):"
+            % (
+                "async def" if self.compiler.enable_async else "def",
+                node.funcname,
+                ",".join(namedecls),
+            )
         )
         filtered = len(node.filter_args.args) > 0
         buffered = eval(node.attributes.get("buffered", "False"))
@@ -722,7 +746,14 @@ class _GenerateRenderMethod:
         if "timeout" in cache_args:
             cache_args["timeout"] = int(eval(cache_args["timeout"]))
 
-        self.printer.writeline("def %s(%s):" % (name, ",".join(args)))
+        self.printer.writeline(
+            "%s %s(%s):"
+            % (
+                "async def" if self.compiler.enable_async else "def",
+                name,
+                ",".join(args),
+            )
+        )
 
         # form "arg1, arg2, arg3=arg3, arg4=arg4", etc.
         pass_args = [
@@ -734,10 +765,17 @@ class _GenerateRenderMethod:
             toplevel=toplevel,
             limit=node_or_pagetag.undeclared_identifiers(),
         )
+        if self.compiler.enable_async:
+            cache_get_or_create = (
+                "await context.get('local').cache._ctx_get_or_create_async("
+            )
+        else:
+            cache_get_or_create = (
+                "context.get('local').cache._ctx_get_or_create("
+            )
         if buffered:
             s = (
-                "context.get('local')."
-                "cache._ctx_get_or_create("
+                cache_get_or_create +
                 "%s, lambda:__M_%s(%s),  context, %s__M_defname=%r)"
                 % (
                     cachekey,
@@ -755,10 +793,9 @@ class _GenerateRenderMethod:
             )
             self.printer.writelines("return " + s, None)
         else:
-            self.printer.writelines(
-                "__M_writer(context.get('local')."
-                "cache._ctx_get_or_create("
-                "%s, lambda:__M_%s(%s), context, %s__M_defname=%r))"
+            s = (
+                cache_get_or_create +
+                "%s, lambda:__M_%s(%s), context, %s__M_defname=%r)"
                 % (
                     cachekey,
                     name,
@@ -767,10 +804,9 @@ class _GenerateRenderMethod:
                         ["%s=%s, " % (k, v) for k, v in cache_args.items()]
                     ),
                     name,
-                ),
-                "return ''",
-                None,
+                )
             )
+            self.printer.writelines("__M_writer(%s)" % s, "return ''", None)
 
     def create_filter_callable(self, args, target, is_expression):
         """write a filter-applying expression based on the filters
@@ -806,6 +842,13 @@ class _GenerateRenderMethod:
 
     def visitExpression(self, node):
         self.printer.start_source(node.lineno)
+        if self.compiler.enable_async:
+            # the expression may call an async def, including implicitly
+            # via "self" / "next" / namespace attributes (e.g.
+            # ${self.body()}); await its result if it is awaitable
+            text = "await runtime._maybe_await(%s)" % node.text
+        else:
+            text = node.text
         if (
             len(node.escapes)
             or (
@@ -815,11 +858,11 @@ class _GenerateRenderMethod:
             or len(self.compiler.default_filters)
         ):
             s = self.create_filter_callable(
-                node.escapes_code.args, "%s" % node.text, True
+                node.escapes_code.args, text, True
             )
             self.printer.writeline("__M_writer(%s)" % s)
         else:
-            self.printer.writeline("__M_writer(%s)" % node.text)
+            self.printer.writeline("__M_writer(%s)" % text)
 
     def visitControlLine(self, node):
         if node.isend:
@@ -914,15 +957,29 @@ class _GenerateRenderMethod:
         self.printer.start_source(node.lineno)
         args = node.attributes.get("args")
         if args:
-            self.printer.writeline(
-                "runtime._include_file(context, %s, _template_uri, %s)"
-                % (node.parsed_attributes["file"], args)
-            )
+            if self.compiler.enable_async:
+                self.printer.writeline(
+                    "await runtime._include_file_async("
+                    "context, %s, _template_uri, %s)"
+                    % (node.parsed_attributes["file"], args)
+                )
+            else:
+                self.printer.writeline(
+                    "runtime._include_file(context, %s, _template_uri, %s)"
+                    % (node.parsed_attributes["file"], args)
+                )
         else:
-            self.printer.writeline(
-                "runtime._include_file(context, %s, _template_uri)"
-                % (node.parsed_attributes["file"])
-            )
+            if self.compiler.enable_async:
+                self.printer.writeline(
+                    "await runtime._include_file_async("
+                    "context, %s, _template_uri)"
+                    % (node.parsed_attributes["file"])
+                )
+            else:
+                self.printer.writeline(
+                    "runtime._include_file(context, %s, _template_uri)"
+                    % (node.parsed_attributes["file"])
+                )
 
     def visitNamespaceTag(self, node):
         pass
@@ -932,7 +989,10 @@ class _GenerateRenderMethod:
 
     def visitBlockTag(self, node):
         if node.is_anonymous:
-            self.printer.writeline("%s()" % node.funcname)
+            if self.compiler.enable_async:
+                self.printer.writeline("await %s()" % node.funcname)
+            else:
+                self.printer.writeline("%s()" % node.funcname)
         else:
             nameargs = node.get_argument_expressions(as_call=True)
             nameargs += ["**pageargs"]
@@ -940,9 +1000,20 @@ class _GenerateRenderMethod:
                 "if 'parent' not in context._data or "
                 "not hasattr(context._data['parent'], '%s'):" % node.funcname
             )
-            self.printer.writeline(
-                "context['self'].%s(%s)" % (node.funcname, ",".join(nameargs))
-            )
+            if self.compiler.enable_async:
+                # the block may resolve to a def in another template
+                # which is not itself compiled for async, so await
+                # only if needed
+                self.printer.writeline(
+                    "await runtime._maybe_await("
+                    "context['self'].%s(%s))"
+                    % (node.funcname, ",".join(nameargs))
+                )
+            else:
+                self.printer.writeline(
+                    "context['self'].%s(%s)"
+                    % (node.funcname, ",".join(nameargs))
+                )
             self.printer.writeline("\n")
 
     def visitCallNamespaceTag(self, node):
@@ -952,7 +1023,10 @@ class _GenerateRenderMethod:
         self.visitCallTag(node)
 
     def visitCallTag(self, node):
-        self.printer.writeline("def ccall(caller):")
+        self.printer.writeline(
+            "%s ccall(caller):"
+            % ("async def" if self.compiler.enable_async else "def")
+        )
         export = ["body"]
         callable_identifiers = self.identifiers.branch(node, nested=True)
         body_identifiers = callable_identifiers.branch(node, nested=False)
@@ -986,7 +1060,13 @@ class _GenerateRenderMethod:
         self.identifier_stack.pop()
 
         bodyargs = node.body_decl.get_argument_expressions()
-        self.printer.writeline("def body(%s):" % ",".join(bodyargs))
+        self.printer.writeline(
+            "%s body(%s):"
+            % (
+                "async def" if self.compiler.enable_async else "def",
+                ",".join(bodyargs),
+            )
+        )
 
         # TODO: figure out best way to specify
         # buffering/nonbuffering (at call time would be better)
@@ -1007,13 +1087,17 @@ class _GenerateRenderMethod:
             # push on caller for nested call
             "context.caller_stack.nextcaller = "
             "runtime.Namespace('caller', context, "
-            "callables=ccall(__M_caller))",
+            "callables=%sccall(__M_caller))"
+            % ("await " if self.compiler.enable_async else ""),
             "try:",
         )
         self.printer.start_source(node.lineno)
+        expression = node.expression
+        if self.compiler.enable_async:
+            expression = "await runtime._maybe_await(%s)" % expression
         self.printer.writelines(
             "__M_writer(%s)"
-            % self.create_filter_callable([], node.expression, True),
+            % self.create_filter_callable([], expression, True),
             "finally:",
             "context.caller_stack.nextcaller = None",
             None,

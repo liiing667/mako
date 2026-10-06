@@ -7,10 +7,47 @@
 """utilities for analyzing expressions and blocks of Python
 code, as well as generating Python from AST nodes"""
 
+import ast as _pyast
 import re
 
 from mako import exceptions
 from mako import pyparser
+
+# nodes which indicate the fragment uses syntax that is only legal within
+# an async function (and therefore require the generated render callable
+# itself to be async)
+_ASYNC_NODES = (_pyast.Await, _pyast.AsyncFor, _pyast.AsyncWith)
+
+
+def uses_async_syntax(expr):
+    """Return True if the given AST uses ``await``, ``async for``, or
+    ``async with`` at the level of the fragment itself.
+
+    Nodes occurring within a nested function or lambda are ignored, as
+    those establish their own scope -- an ``async def`` embedded in a
+    template body is valid inside an ordinary (synchronous) function.
+
+    """
+
+    stack = [(expr, True)]
+    while stack:
+        node, toplevel = stack.pop()
+        if not toplevel and isinstance(
+            node,
+            (
+                _pyast.FunctionDef,
+                _pyast.AsyncFunctionDef,
+                _pyast.Lambda,
+            ),
+        ):
+            continue
+        if isinstance(node, _ASYNC_NODES):
+            return True
+        if isinstance(node, _pyast.comprehension) and node.is_async:
+            return True
+        for child in _pyast.iter_child_nodes(node):
+            stack.append((child, False))
+    return False
 
 
 class PythonCode:
@@ -56,6 +93,9 @@ class PythonCode:
 
         f = pyparser.FindIdentifiers(self, **exception_kwargs)
         f.visit(expr)
+
+        # True if the fragment needs to live inside an async function
+        self.has_await = uses_async_syntax(expr)
 
 
 class ArgumentList:
@@ -109,6 +149,14 @@ class PythonFragment(PythonCode):
 
         if keyword in ["for", "if", "while"]:
             code = code + "pass"
+        elif keyword == "async":
+            if re.match(r"(?:for|with)\b", expr or ""):
+                code = code + "pass"
+            else:
+                raise exceptions.CompileException(
+                    "Unsupported control keyword: '%s'" % keyword,
+                    **exception_kwargs,
+                )
         elif keyword == "try":
             code = code + "pass\nexcept:pass"
         elif keyword in ["elif", "else"]:
